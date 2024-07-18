@@ -10,15 +10,41 @@ torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
 from diffusers.models import AutoencoderKL
 from download import find_model
-from models import SiT_models
+from models_hook import SiT_models
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from transport import create_transport, Sampler
 import argparse
 import sys
 from time import time
+from torchvision.transforms import v2
+from PIL import Image
+from torchvision.datasets import ImageFolder
+from torch.utils.data import DataLoader
+import os
+import numpy as np
+from tqdm import tqdm
+SAVE_PATH = "/home/yifulu/work/sae/SiT_IN10_20lay_t0.1"
 
+def center_crop_arr(pil_image, image_size):
+    """
+    Center cropping implementation from ADM.
+    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
+    """
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+        )
 
-def main(mode, args):
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+    )
+
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+def main( args):
     # Setup PyTorch:
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
@@ -45,6 +71,7 @@ def main(mode, args):
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
+    model=torch.compile(model,fullgraph =True,mode="max-autotune")
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -52,77 +79,53 @@ def main(mode, args):
         args.train_eps,
         args.sample_eps
     )
-    sampler = Sampler(transport)
-    print("created sampler")
-    if mode == "ODE":
-        if args.likelihood:
-            assert args.cfg_scale == 1, "Likelihood is incompatible with guidance"
-            sample_fn = sampler.sample_ode_likelihood(
-                sampling_method=args.sampling_method,
-                num_steps=args.num_sampling_steps,
-                atol=args.atol,
-                rtol=args.rtol,
-            )
-        else:
-            sample_fn = sampler.sample_ode(
-                sampling_method=args.sampling_method,
-                num_steps=args.num_sampling_steps,
-                atol=args.atol,
-                rtol=args.rtol,
-                reverse=args.reverse
-            )
-            
-    elif mode == "SDE":
-        sample_fn = sampler.sample_sde(
-            sampling_method=args.sampling_method,
-            diffusion_form=args.diffusion_form,
-            diffusion_norm=args.diffusion_norm,
-            last_step=args.last_step,
-            last_step_size=args.last_step_size,
-            num_steps=args.num_sampling_steps,
-        )
+    # transport_sampler = Sampler(transport)
     
-
+    print("created sampler")
+    
+    transform = v2.Compose([
+        v2.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+        v2.ToImage(),
+        v2.ToDtype(torch.uint8, scale=True),
+        v2.RandomHorizontalFlip(),
+        v2.ToDtype(torch.float32, scale=True),  
+        v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    ])
+    dataset = ImageFolder(args.data_path, transform=transform)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False,
+        prefatch_factor=8
+        )
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     print("load vae")
-
-    # Labels to condition the model with (feel free to change):
-    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-    
-    # Create sampling noise:
-    n = len(class_labels)
-    z = torch.randn(n, 4, latent_size, latent_size, device=device)
-    y = torch.tensor(class_labels, device=device)
-
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device=device)
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
-
-    # Sample images:
-    start_time = time()
-    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
-    print(f"Sampling took {time() - start_time:.2f} seconds.")
-
-    # Save and display images:
-    save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
-
+    timestep = 0.1
+    i = 0
+    buffer = []
+    with torch.no_grad():
+        for x, y in tqdm(loader):
+            x = x.to(device)
+            y = y.to(device)
+            t = torch.full(y.shape,timestep,device=device)
+            x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            model_kwargs = dict(y=y)
+            t, xt, ut = transport.path_sampler.plan(t, torch.randn_like(x), x)
+            model_output = model(xt, t, **model_kwargs)
+            buffer.append(model_output.cpu())
+            i+=1
+            if i%5 == 0:
+                tens = torch.cat(buffer)
+                torch.save(tens, os.path.join(SAVE_PATH,f"output_{i//5}.pt"))
+                buffer = []
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
-    if len(sys.argv) < 2:
-        print("Usage: program.py <mode> [options]")
-        sys.exit(1)
-    
-    mode = sys.argv[1]
-
-    assert mode[:2] != "--", "Usage: program.py <mode> [options]"
-    assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
-    
+    parser.add_argument("--data-path", type=str, required=True)
+   
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -133,14 +136,9 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 
+    parser.add_argument("--batch-size", type=int, default=256)
 
     parse_transport_args(parser)
-    if mode == "ODE":
-        parse_ode_args(parser)
-        # Further processing for ODE
-    elif mode == "SDE":
-        parse_sde_args(parser)
-        # Further processing for SDE
-    
+   
     args = parser.parse_known_args()[0]
-    main(mode, args)
+    main( args)
