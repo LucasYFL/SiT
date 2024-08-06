@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader,Dataset
 import wandb
-ACT_PATH = "/home/yifulu/work/sae/SiT_IN10_20lay_t0.1"
+ACT_PATH = "/home/yifulu/work/sae/SiT_IN10_20lay_t0.1_uncond"
 epoch = 50
 BS = 1024
 lr = 4e-4
@@ -13,7 +13,7 @@ l1_coeff = 8e-5
 expand = 128
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 wandb.init(entity="yflpersonal",project="sae_SiT_IN10_20lay_t0.1",
-            name=f"epo_{epoch}_bs_{BS}_lr_{lr}_l1_{l1_coeff}_expand_{expand}_ty",)
+            name=f"epo_{epoch}_bs_{BS}_lr_{lr}_l1_{l1_coeff}_expand_{expand}_ty_uncond",)
 class act_data(Dataset):
     def __init__(self,act_path):
         files = os.listdir(act_path)
@@ -58,5 +58,5 @@ for epo in range(epoch):
             print(f"step {i} loss {loss.item()} mse {recon.item()} l1 {l1_loss.item()}")
             wandb.log({'epoch': epo, 'loss':loss.item(), 
                         'mse': recon.item(), "l1": l1_loss.item()})
-torch.save(model.state_dict(),f"epo_{epoch}_bs_{BS}_lr_{lr}_l1_{l1_coeff}_expand_{expand}_ty_sae.pth")
+torch.save(model.state_dict(),f"epo_{epoch}_bs_{BS}_lr_{lr}_l1_{l1_coeff}_expand_{expand}_ty_sae_uncond.pth")
 print("Done")

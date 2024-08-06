@@ -23,8 +23,14 @@ from torch.utils.data import DataLoader
 import os
 import numpy as np
 from tqdm import tqdm
-SAVE_PATH = "/home/yifulu/work/sae/SiT_IN10_20lay_t0.9_uncond"
+from transport.utils import EasyDict, log_state, mean_flat
 
+SAVE_PATH = "/home/yifulu/work/sae/SiT_IN10_20lay_t0.1"
+from sae import sae
+epoch = 50
+BS = 1024
+lr = 4e-4
+l1_coeff = 8e-5
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
@@ -49,6 +55,7 @@ def main( args):
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    expand = args.expand
 
     if args.ckpt is None:
         assert args.model == "SiT-XL/2", "Only SiT-XL/2 models are available for auto-download."
@@ -70,8 +77,13 @@ def main( args):
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
+    # model=torch.compile(model,fullgraph =True,mode="max-autotune")
+    sae_model = sae(expand,1152).to(device)
+    state_dict = torch.load(f"epo_{epoch}_bs_{BS}_lr_{lr}_l1_{l1_coeff}_expand_{expand}_ty_sae.pth")
+    sae_model.load_state_dict(state_dict)
+    model.sae = sae_model
     model.eval()  # important!
-    model=torch.compile(model,fullgraph =True,mode="max-autotune")
+    
     transport = create_transport(
         args.path_type,
         args.prediction,
@@ -104,24 +116,25 @@ def main( args):
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     print("load vae")
     timestep = 0.1
-    i = 0
-    buffer = []
+    l0s = []
+    losses = []
     with torch.no_grad():
         for x, y in tqdm(loader):
             x = x.to(device)
             y = y.to(device)
             t = torch.full(y.shape,timestep,device=device)
-            y = torch.full(y.shape,1000,device=device)
+            # y = torch.full(y.shape,1000,device=device)
+            
             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             model_kwargs = dict(y=y)
-            t, xt, ut = transport.path_sampler.plan(t, torch.randn_like(x), x)
-            model_output = model(xt, t, **model_kwargs)
-            buffer.append(model_output.cpu())
-            i+=1
-            if i%5 == 0:
-                tens = torch.cat(buffer)
-                torch.save(tens, os.path.join(SAVE_PATH,f"output_{i//5}.pt"))
-                buffer = []
+            x0 = torch.randn_like(x)
+            t, xt, ut = transport.path_sampler.plan(t,x0 , x)
+            model_output,feat = model(xt, t, **model_kwargs)
+            l0s.append(feat.norm(dim=-1, p=0).mean().item())
+            loss = mean_flat(((model_output - ut) ** 2))
+            losses.append(loss.mean().item())
+    print("l0 norm:", np.mean(l0s))
+    print("loss:", np.mean(losses))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -138,6 +151,7 @@ if __name__ == "__main__":
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--expand", type=int, default=1)
 
     parse_transport_args(parser)
    

@@ -14,7 +14,7 @@ class sae(nn.Module):
         self.W_enc = nn.Parameter(
             torch.nn.init.kaiming_uniform_(
                 torch.empty(
-                    int(expand_ratio*channels), channels
+                    channels, int(expand_ratio*channels)
                 )
             )
         )

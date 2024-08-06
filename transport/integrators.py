@@ -94,7 +94,7 @@ class ode:
         self.atol = atol
         self.rtol = rtol
         self.sampler_type = sampler_type
-
+        print(self.t)
     def sample(self, x, model, **model_kwargs):
         
         device = x[0].device if isinstance(x, tuple) else x.device

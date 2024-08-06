@@ -11,7 +11,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
-
+from sae import sae
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -240,12 +240,24 @@ class SiT(nn.Module):
         c = t + y                                # (N, D)
         for block in self.blocks[:20]:
             x = block(x, c)                      # (N, T, D)
-        return x
+        # return x
+        if self.sae is None:
+            return x
+        else:
+            N,T,D = x.shape
+            feat,_,x = self.sae(x.reshape(N*T,D))
+            # feat,_,x = self.sae(x.mean(dim=1))
+            return x,feat
+            # print(x.shape)
+            x = x.view(N,T,D)
+            # feat = feat.view(N,T,D)
+        for block in self.blocks[20:]:
+            x = block(x, c)    
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
-        return x
+        return x, feat
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
